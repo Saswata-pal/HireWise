@@ -8,6 +8,7 @@ import pandas as pd
 import faiss
 import textwrap
 import docx
+import hashlib
 from sentence_transformers import SentenceTransformer
 from config import UNIVERSAL_TECH_TAXONOMY, ARTIFACT_DIR, ASSETS_DIR
 
@@ -54,16 +55,6 @@ def execute_ranking(candidates_file, jd_file, output_file):
     target_yoe_min = jd_llm_weights.get("min_yoe", 5)
     target_yoe_max = jd_llm_weights.get("max_yoe", 9)
 
-    yoe_matches = re.findall(r'(\d+)(?:-|-| to )(\d+)\s*years|\b(\d+)\+\s*years', jd_text)
-    if yoe_matches:
-        extracted_nums = [int(m) for tuple_match in yoe_matches for m in tuple_match if m]
-        if len(extracted_nums) >= 2:
-            target_yoe_min = min(extracted_nums)
-            target_yoe_max = max(extracted_nums)
-        elif len(extracted_nums) == 1:
-            target_yoe_min = extracted_nums[0]
-            target_yoe_max = target_yoe_min + 4
-
     print(f"[*] Dynamic YOE Target Extracted: {target_yoe_min} to {target_yoe_max} years")
 
     TOP_N = 14
@@ -78,8 +69,18 @@ def execute_ranking(candidates_file, jd_file, output_file):
     top_indices = semantic_indices[0]
     top_semantic_scores = semantic_scores[0]
 
-    subset_tax_matrix = tax_matrix[top_indices]
-    subset_metadata = metadata_df.iloc[top_indices].reset_index(drop=True)
+    subset_tax_matrix_raw = tax_matrix[top_indices]
+    subset_metadata_raw = metadata_df.iloc[top_indices].reset_index(drop=True)
+
+    print("[*] Purging Fatal Profiles to optimize compute...")
+    valid_mask = ~subset_metadata_raw['is_fatal'].values 
+
+    subset_metadata = subset_metadata_raw[valid_mask].copy()
+    subset_tax_matrix = subset_tax_matrix_raw[valid_mask]
+
+    top_semantic_scores = top_semantic_scores[valid_mask]
+
+    print(f"[*] Remaining valid candidates for scoring: {len(subset_metadata)}")
 
     print("[*] Applying Hybrid Math & Behavioral Penalties...")
     tax_scores = np.dot(subset_tax_matrix, jd_tax_vector)
@@ -87,22 +88,34 @@ def execute_ranking(candidates_file, jd_file, output_file):
 
     yoe = subset_metadata['years_of_experience'].values
     yoe_multiplier = np.ones_like(yoe, dtype=float)
+
     yoe_multiplier[(yoe >= target_yoe_min) & (yoe <= target_yoe_max)] = 1.05
-    yoe_multiplier[yoe < (target_yoe_min - 2)] = 0.40
-    yoe_multiplier[(yoe >= (target_yoe_min - 2)) & (yoe < target_yoe_min)] = 0.85
+
+    yoe_multiplier[(yoe >= target_yoe_min - 1) & (yoe < target_yoe_min)] = 0.90 
+    yoe_multiplier[(yoe >= target_yoe_min - 2) & (yoe < target_yoe_min - 1)] = 0.75 
+    yoe_multiplier[(yoe >= target_yoe_min - 3) & (yoe < target_yoe_min - 2)] = 0.50 
+    yoe_multiplier[yoe < target_yoe_min - 3] = 0.25
 
     over_exp_diff = np.maximum(0, yoe - (target_yoe_max + 2))
     over_penalty = np.maximum(0.90, 1.0 - (over_exp_diff * 0.01))
     yoe_multiplier = np.where(yoe > (target_yoe_max + 2), over_penalty, yoe_multiplier)
 
-    is_dead_profile = (subset_metadata.get('days_since_active', 0) > 180) & (subset_metadata.get('applications_submitted', 0) == 0)
-    activity_penalty = np.where(is_dead_profile, 0.85, 1.0)
-    response_penalty = np.where(subset_metadata.get('response_rate', 1.0) < 0.10, 0.95, 1.0)
-    flakiness_penalty = np.where(subset_metadata.get('interview_completion', 1.0) < 0.50, 0.85, 1.0)
-    notice_penalty = np.where(subset_metadata.get('notice_period', 30) > 60, 0.97, 1.0)
+    days_since_active = subset_metadata['days_since_active'].values
+    apps_submitted = subset_metadata['applications_submitted'].values
+    response_rate = subset_metadata['response_rate'].values
+    interview_comp = subset_metadata['interview_completion'].values
+    notice_period = subset_metadata['notice_period'].values
+    saved_by_rec = subset_metadata['saved_by_recruiters'].values
+    github_score = subset_metadata['github_score'].values
 
-    market_boost = np.clip(subset_metadata.get('saved_by_recruiters', 0).values * 0.01, 0.0, 0.10)
-    github_boost = np.where(subset_metadata.get('github_score', 0) > 80, 0.05, 0.0)
+    is_dead_profile = (days_since_active > 180) & (apps_submitted == 0)
+    activity_penalty = np.where(is_dead_profile, 0.85, 1.0)
+    response_penalty = np.where(response_rate < 0.10, 0.95, 1.0)
+    flakiness_penalty = np.where(interview_comp < 0.50, 0.85, 1.0)
+    notice_penalty = np.where(notice_period > 60, 0.97, 1.0)
+
+    market_boost = np.clip(saved_by_rec * 0.01, 0.0, 0.10)
+    github_boost = np.where(github_score > 80, 0.05, 0.0)
 
     behavioral_modifier = activity_penalty * response_penalty * flakiness_penalty * notice_penalty * (1.0 + market_boost + github_boost)
 
@@ -111,9 +124,8 @@ def execute_ranking(candidates_file, jd_file, output_file):
     subset_metadata['final_score'] = subset_metadata['final_score'].round(4)
     subset_metadata['tax_scores'] = list(subset_tax_matrix)
 
-    print("[*] Filtering Honeypots and Sorting Validators...")
-    clean_candidates = subset_metadata[subset_metadata['is_fatal'] == False].copy()
-    clean_candidates = clean_candidates.sort_values(by=['final_score', 'candidate_id'], ascending=[False, True])
+    print("[*] Sorting Top Validators...")
+    clean_candidates = subset_metadata.sort_values(by=['final_score', 'candidate_id'], ascending=[False, True])
     top_100 = clean_candidates.head(100).copy()
 
     print("[*] Generating Step 16 Confidence Scores and Reasoning...")
@@ -163,7 +175,9 @@ def execute_ranking(candidates_file, jd_file, output_file):
 
         best_tag_score = top_cand_scores[best_relative_idx]
         has_gap = cand_tax[worst_actual_idx] <= 0.50
-        variation = rank % 5
+        cid_bytes = str(row['candidate_id']).encode('utf-8')
+        stable_hash = int(hashlib.md5(cid_bytes).hexdigest(), 16)
+        variation = stable_hash % 5
 
         if best_tag_score < 0.65 or raw_quote == "NO_EVIDENCE":
             trapdoor_templates = [
@@ -201,12 +215,12 @@ def execute_ranking(candidates_file, jd_file, output_file):
                 ]
             else:
                 templates = [
-                    f"Included primarily for {best_tag} ('{short_quote}')." + (f" Disqualified on {worst_tag}." if has_gap else " Weak overall signals.") + f" {exp_note}",
-                    f"Marginal fit. {exp_note} They managed to trigger our {best_tag} filters ('{short_quote}')," + (f" but completely miss {worst_tag}." if has_gap else " but rest are okk."),
-                    f"{exp_note} A weak overall option, though they do possess {best_tag} ('{short_quote}')." + (f" No evidence of {worst_tag}." if has_gap else ""),
-                    f"Filler profile. '{short_quote}' gave them points for {best_tag}." + (f" Unqualified for {worst_tag}." if has_gap else "") + f" {exp_note}",
-                    f"Bottom of the list. {exp_note} Matched {best_tag} ('{short_quote}')" + (f" but deeply deficient in {worst_tag}." if has_gap else " with very little else to offer.")
-                ]
+                f"Partial match. Shows some background in {best_tag} ('{short_quote}')." + (f" Disqualified for core roles based on {worst_tag} gaps." if has_gap else " Lacks strong primary signals.") + f" {exp_note}",
+                f"Requires further review. {exp_note} While they trigger filters for {best_tag} ('{short_quote}')," + (f" they lack demonstrable {worst_tag} experience." if has_gap else " the broader profile is light on details."),
+                f"{exp_note} Alternative profile. They possess baseline {best_tag} experience ('{short_quote}')." + (f" No direct evidence of {worst_tag}." if has_gap else ""),
+                f"Secondary match. Highlights {best_tag} via '{short_quote}'." + (f" Does not meet the technical threshold for {worst_tag}." if has_gap else "") + f" {exp_note}",
+                f"Atypical fit for this specific JD. {exp_note} Matches {best_tag} ('{short_quote}')" + (f" but is deeply deficient in {worst_tag}." if has_gap else " but offers limited alignment elsewhere.")
+            ]
 
             reasoning = templates[variation]
 

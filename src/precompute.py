@@ -64,10 +64,12 @@ def run_pipeline(candidates_path):
 
             max_sim_scores = np.max(sim_matrix, axis=0)
             best_sentence_indices = np.argmax(sim_matrix, axis=0)
-            coverage_counts = np.sum(sim_matrix > 0.50, axis=0)
 
-            coverage_bonus = np.clip(coverage_counts * 0.05, 0.0, 0.25)
-            adjusted_tax_scores = max_sim_scores * (1.0 + coverage_bonus)
+            supporting_counts = np.maximum(0, np.sum(sim_matrix > 0.65, axis=0) - 1)
+
+            bonus_multiplier = 1.0 + np.clip(supporting_counts * 0.02, 0.0, 0.10)
+
+            adjusted_tax_scores = np.clip(max_sim_scores * bonus_multiplier, 0.0, 1.0)
 
             cand_text_lower = " ".join(all_sentences[start:end]).lower()
             impact_matches = len(re.findall(r'(\d+%|\d+\s*(million|m|k|users|requests|tps)|reduced|increased|improved|saved)', cand_text_lower))
@@ -127,9 +129,7 @@ def run_pipeline(candidates_path):
     tax_matrix = np.vstack(tax_score_matrix).astype(np.float32)
 
     print("\n[*] Normalizing taxonomy scores...")
-    min_vals = tax_matrix.min(axis=0)
-    max_vals = tax_matrix.max(axis=0)
-    tax_matrix_normalized = (tax_matrix - min_vals) / (max_vals - min_vals + 1e-9)
+    tax_matrix_normalized = np.clip(tax_matrix, 0.0, 1.0)
 
     os.makedirs(ARTIFACT_DIR, exist_ok=True)
     print("[*] Saving optimized artifacts to disk...")
