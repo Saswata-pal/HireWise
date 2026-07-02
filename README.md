@@ -54,6 +54,8 @@ Our solution shifts the paradigm from generative inference to an **extract-and-c
 
 ## End-to-End System Architecture
 
+![HireWise Flow](./assets/hirewise_animated_flow.jpg)
+
 The workflow is cleanly split into two decoupled runtime phases:
 1. **Stage 1 — Offline Preprocessing Pipeline (Batch)**: Run once in advance to build the localized Feature Store.
 2. **Stage 2 — Online Ranking Pipeline (Interactive)**: Run on-demand when a new Job Description is received, resolving results in under 5 minutes.
