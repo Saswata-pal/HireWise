@@ -1,4 +1,4 @@
-# Redrob AI Candidate Discovery & Ranking Engine
+# Redrob AI Candidate Discovery & Ranking Engine (HireWise)
 
 ### Production-Grade Predictive Talent Acquisition Platform for Large-Scale Semantic Matchmaking
 
